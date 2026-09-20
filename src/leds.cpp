@@ -5,52 +5,36 @@ TaskHandle_t Leds::redLedTask,Leds::greenLedTask;
 unsigned int Leds::redOn = 100;
 unsigned int Leds::redOff = 100;
 
-Leds::BTSTATUS Leds::btStatus;
-Leds::WIFISTATUS Leds::wifiStatus;
+Leds::BLINKMODE Leds::blinkMode = Leds::blink_off;
 
 extern Logger logger;
 
+void Leds::setBlinkMode(BLINKMODE mode) {
+    if (blinkMode != mode) {
+        blinkMode = mode;
+    }
+}
+
 void Leds::manageRedLed(void * pvParameters){
   for(;;){
-    if (btStatus == bt_connected && wifiStatus == wifi_connected) {
-      redOn = 50;
-      redOff = 50;
+    switch (blinkMode) {
+        case blink_fast:
+            digitalWrite(RED_LED, (millis() % 200UL) < 100UL ? HIGH : LOW);
+            break;
+        case blink_slow:
+            digitalWrite(RED_LED, (millis() % 1000UL) < 500UL ? HIGH : LOW);
+            break;
+        case blink_off:
+        default:
+            digitalWrite(RED_LED, LOW);
+            break;
     }
-    else if (btStatus == bt_connected) {
-      redOn = 200;
-      redOff = 50;
-    }
-    else if (wifiStatus == wifi_connected) {
-      redOn = 50;
-      redOff = 200;
-    }
-    else if (btStatus == bt_on && wifiStatus == wifi_on) {
-      redOn = 100;
-      redOff = 100;
-    }
-    else if (btStatus == bt_on) {
-      redOn = 300;
-      redOff = 300;
-    }
-    else if (wifiStatus == wifi_on) {
-      redOn = 400;
-      redOff = 100;
-    }
-    else {
-      redOn = 1;
-      redOff = 999;
-    }
-
-    digitalWrite(RED_LED, HIGH);
-    delay(redOn);
-    digitalWrite(RED_LED, LOW);
-    delay(redOff);
+    delay(50);
   }
 }
   
 void Leds::setup() {
-    btStatus = bt_off;
-    wifiStatus = wifi_off;
+    blinkMode = blink_off;
     pinMode(RED_LED,OUTPUT);
     xTaskCreate(Leds::manageRedLed,"redLed",1024,NULL,10,&redLedTask); 
     logger.print("LED+"); 

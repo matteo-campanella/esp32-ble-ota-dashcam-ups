@@ -8,18 +8,13 @@ class Leds{
         static TaskHandle_t greenLedTask,redLedTask;
         static unsigned int redOn,redOff,greenOff,greenOn;
     public:
-        enum WIFISTATUS {
-            wifi_on,
-            wifi_connected,
-            wifi_off,
+        enum BLINKMODE {
+            blink_off,
+            blink_fast,
+            blink_slow,
         };
-        enum BTSTATUS {
-            bt_on,
-            bt_connected,
-            bt_off
-        };
-        static WIFISTATUS wifiStatus;
-        static BTSTATUS btStatus;
+        static BLINKMODE blinkMode;
         static void setup();
+        static void setBlinkMode(BLINKMODE mode);
         static void manageRedLed(void *);
 };
