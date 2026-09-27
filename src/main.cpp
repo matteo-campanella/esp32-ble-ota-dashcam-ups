@@ -15,22 +15,33 @@ enum class RuntimeState : uint8_t { Measure, ConnectionWindow };
 
 struct VoltageAccumulator {
     uint32_t sum = 0;
+    uint32_t externalSupplySum = 0;
     uint8_t count = 0;
+    uint8_t externalSupplyCount = 0;
     unsigned long startedAt = 0;
     unsigned long lastSampleAt = 0;
 
     void reset() {
         sum = 0;
+        externalSupplySum = 0;
         count = 0;
+        externalSupplyCount = 0;
         startedAt = millis();
         lastSampleAt = 0;
     }
 
     // A valid result exists only after this complete moving-average window.
-    bool update(uint16_t &millivolts) {
+    bool update(uint16_t &millivolts, uint16_t &externalSupplyMillivolts) {
         const unsigned long now = millis();
         if (lastSampleAt != 0 && now - lastSampleAt < BATTERY_VALIDATION_SAMPLE_MS) return false;
         lastSampleAt = now;
+
+        // A zero external reading is valid: it means the external supply is
+        // absent. It is collected independently of battery validity.
+        const uint32_t externalAdcMillivolts = analogReadMilliVolts(EXTERNAL_SUPPLY_ADC_PIN);
+        externalSupplySum += (externalAdcMillivolts * EXTERNAL_SUPPLY_CALIBRATION_X1000 + 500UL) /
+                             1000UL;
+        ++externalSupplyCount;
 
         const uint16_t raw = analogRead(ADC_PIN);
         if (raw == 0) return false;
@@ -41,14 +52,21 @@ struct VoltageAccumulator {
         if (adcMillivolts == 0) return false;
         sum += (adcMillivolts * BATTERY_DIVIDER_NUMERATOR) /
                BATTERY_DIVIDER_BOTTOM_OHMS;
+
         ++count;
         if (count < BATTERY_VALIDATION_SAMPLES) return false;
 
         millivolts = static_cast<uint16_t>(sum / count);
+        externalSupplyMillivolts = externalSupplyMillivoltsAverage();
         return true;
     }
 
     bool timedOut() const { return millis() - startedAt >= BATTERY_VALIDATION_TIMEOUT_MS; }
+
+    uint16_t externalSupplyMillivoltsAverage() const {
+        return externalSupplyCount == 0 ? 0
+                                        : static_cast<uint16_t>(externalSupplySum / externalSupplyCount);
+    }
 };
 
 RuntimeState state = RuntimeState::Measure;
@@ -60,8 +78,11 @@ bool wifiListening = false;
 bool lastBleConnectionState = false;
 
 uint64_t sleepIntervalUs() {
-    const uint64_t seconds = lowBatteryState ? LOW_BATTERY_DEEP_SLEEP_INTERVAL_SEC
-                                             : DEEP_SLEEP_INTERVAL_SEC;
+    uint32_t seconds = lowBatteryState ? LOW_BATTERY_DEEP_SLEEP_INTERVAL_SEC
+                                       : DEEP_SLEEP_INTERVAL_SEC;
+    const uint32_t transitionSeconds = configuration_seconds_until_transition();
+    if (transitionSeconds < seconds) seconds = transitionSeconds;
+    if (seconds == 0) seconds = 1;
     return seconds * 1000000ULL;
 }
 
@@ -74,28 +95,43 @@ unsigned long connectionWindowMs() {
 void switchOn() { digitalWrite(SWITCH_PIN, HIGH); }
 void switchOff() { digitalWrite(SWITCH_PIN, LOW); }
 
+void applyLoadPolicy() {
+    // A forced ON request only overrides the weekly calendar. It never defeats
+    // low-battery protection or an invalid measurement.
+    if (lowBatteryState || !configuration_load_is_allowed()) switchOff();
+    else switchOn();
+}
+
+unsigned long activeConnectionWindowMs() {
+    unsigned long window = connectionWindowMs();
+    if (ble_is_connected()) {
+        const unsigned long connectedWindow = BLE_CONNECTED_WINDOW_SEC * 1000UL;
+        if (connectedWindow > window) window = connectedWindow;
+    }
+    return window;
+}
+
 void applyBatteryState(uint16_t millivolts, bool measurementValid) {
     if (!measurementValid) {
         // An unknown voltage must never turn the protected load on.
         lowBatteryState = true;
-        switchOff();
+        applyLoadPolicy();
         logger.println("Battery measurement timed out: 0.000 V; load kept off.");
         return;
     }
 
     const bool wasLow = lowBatteryState;
-    if (millivolts < LOW_BATTERY_VOLTAGE_THRESHOLD) {
+    if (millivolts < deviceConfiguration.lowBatteryMillivolts) {
         lowBatteryState = true;
-    } else if (lowBatteryState && millivolts >= BATTERY_RECOVERY_VOLTAGE_THRESHOLD) {
+    } else if (lowBatteryState && millivolts >= deviceConfiguration.recoveryMillivolts) {
         lowBatteryState = false;
     }
 
+    applyLoadPolicy();
     if (lowBatteryState) {
-        switchOff();
         if (!wasLow) logger.printfln("LOWBAT V=%u", millivolts);
     } else {
         // This includes the hysteresis band when the previous state was OK.
-        switchOn();
         if (wasLow) logger.printfln("BATTERY OK V=%u", millivolts);
     }
 }
@@ -133,7 +169,7 @@ void startRadios() {
 }
 
 void refreshAdvertisedStatus() {
-    ble_advertise_status(bleData.voltage,
+    ble_advertise_status(bleData.voltage, bleData.externalSupplyVoltage,
                          digitalRead(SWITCH_PIN) == HIGH,
                          lowBatteryState,
                          WiFi.status() == WL_CONNECTED);
@@ -152,6 +188,7 @@ void stopRadios() {
 
 [[noreturn]] void enterDeepSleep() {
     const uint64_t intervalUs = sleepIntervalUs();
+    configuration_prepare_sleep(static_cast<uint32_t>(intervalUs / 1000000ULL));
     stopRadios();
     leds.setBlinkMode(Leds::blink_off);
     digitalWrite(RED_LED, LOW);
@@ -174,10 +211,15 @@ void stopRadios() {
 
 void printStatus() {
     logger.printf("\nV: %u\n", bleData.voltage);
+    logger.printf("ExternalSupply: %u\n", bleData.externalSupplyVoltage);
     logger.printf("Status: %s\n", digitalRead(SWITCH_PIN) ? "ON" : "OFF");
     logger.printf("LowBattery: %s\n", lowBatteryState ? "YES" : "NO");
     logger.printf("BLE: %s\n", ble_is_connected() ? "CONNECTED" : "OFF");
     logger.printf("WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "CONNECTED" : "OFF");
+    logger.printf("Override: %u\n", static_cast<uint8_t>(deviceConfiguration.overrideMode));
+    logger.printf("Calendar: %s\n", deviceConfiguration.calendarEnabled ? "ON" : "OFF");
+    logger.printf("Battery thresholds: %u/%u mV\n", deviceConfiguration.lowBatteryMillivolts,
+                  deviceConfiguration.recoveryMillivolts);
 }
 
 void checkIncomingCommands() {
@@ -186,6 +228,17 @@ void checkIncomingCommands() {
     if (Serial.available() > 0) command = Serial.readStringUntil('\n');
     command.trim();
     if (command.length() == 0) return;
+
+    String configurationResponse;
+    if (configuration_handle_command(command, configurationResponse)) {
+        // Threshold, override, calendar, and time changes all apply in this
+        // active BLE window. Re-evaluate battery hysteresis when possible.
+        if (bleData.voltage != 0) applyBatteryState(bleData.voltage, true);
+        else applyLoadPolicy();
+        logger.println(configurationResponse.c_str());
+        refreshAdvertisedStatus();
+        return;
+    }
 
     if (command == "r" || command == "reset") {
         logger.println("Restarting ESP...");
@@ -200,8 +253,13 @@ void checkIncomingCommands() {
 
 void startConnectionWindow() {
     applyBatteryState(bleData.voltage, bleData.voltage != 0);
+    history_append(bleData.voltage, lowBatteryState, digitalRead(SWITCH_PIN) == HIGH,
+                   bleData.voltage != 0, configuration_now_epoch());
     logger.printfln("Battery measurement: %u.%03u V", bleData.voltage / 1000U,
                     bleData.voltage % 1000U);
+    logger.printfln("External supply measurement: %u.%03u V",
+                    bleData.externalSupplyVoltage / 1000U,
+                    bleData.externalSupplyVoltage % 1000U);
     connectionWindowStartedAt = millis();
     startRadios();
     refreshAdvertisedStatus();
@@ -218,6 +276,8 @@ void setup() {
     Serial.begin(115200);
     Serial.println();
     Serial.flush();
+    configuration_begin(timerWake);
+    history_begin();
     pinMode(SWITCH_PIN, OUTPUT);
     if (timerWake) {
         // Configure the reset GPIO logic while the pad is still held, then
@@ -255,11 +315,14 @@ void loop() {
     switch (state) {
         case RuntimeState::Measure: {
             uint16_t millivolts = 0;
-            if (voltageSamples.update(millivolts)) {
+            uint16_t externalSupplyMillivolts = 0;
+            if (voltageSamples.update(millivolts, externalSupplyMillivolts)) {
                 bleData.voltage = millivolts;
+                bleData.externalSupplyVoltage = externalSupplyMillivolts;
                 startConnectionWindow();
             } else if (voltageSamples.timedOut()) {
                 bleData.voltage = 0;
+                bleData.externalSupplyVoltage = voltageSamples.externalSupplyMillivoltsAverage();
                 startConnectionWindow();
             }
             break;
@@ -268,6 +331,9 @@ void loop() {
             checkIncomingCommands();
             // A sleep command resumes here only after wake, in Measure state.
             if (state != RuntimeState::ConnectionWindow) break;
+            // A calendar boundary can occur while the connection window is
+            // open; apply it immediately instead of waiting for the next wake.
+            applyLoadPolicy();
             serviceWifiConnection();
             if (!wifiListening && WiFi.status() == WL_CONNECTED) {
                 logger.udpListen();
@@ -280,10 +346,14 @@ void loop() {
             const bool bleConnectionState = ble_is_connected();
             if (bleConnectionState != lastBleConnectionState) {
                 lastBleConnectionState = bleConnectionState;
+                // A successful connection earns a complete configuration
+                // window. This is especially necessary when the low-battery
+                // idle window is intentionally very short.
+                if (bleConnectionState) connectionWindowStartedAt = millis();
                 refreshAdvertisedStatus();
                 if (bleConnectionState) ble_update(&bleData);
             }
-            if (connectionWindowMs() == 0 || millis() - connectionWindowStartedAt >= connectionWindowMs()) {
+            if (activeConnectionWindowMs() == 0 || millis() - connectionWindowStartedAt >= activeConnectionWindowMs()) {
                 logger.printfln("Cycle complete; battery=%s", lowBatteryState ? "LOW" : "OK");
                 enterDeepSleep();
             }
