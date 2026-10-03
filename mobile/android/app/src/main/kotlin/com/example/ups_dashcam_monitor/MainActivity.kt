@@ -24,8 +24,25 @@ class MainActivity : FlutterActivity() {
                     ))
                     return@setMethodCallHandler
                 }
+                if (call.method == "clearSyncedHistory") {
+                    getSharedPreferences(ForegroundSyncService.HISTORY_PREFERENCES, MODE_PRIVATE)
+                        .edit()
+                        .clear()
+                        .apply()
+                    result.success(null)
+                    return@setMethodCallHandler
+                }
                 if (call.method == "isForegroundSyncActive") {
                     result.success(ForegroundSyncService.isActive)
+                    return@setMethodCallHandler
+                }
+                if (call.method == "getForegroundSyncResult") {
+                    val preferences = getSharedPreferences(ForegroundSyncService.RESULT_PREFERENCES, MODE_PRIVATE)
+                    result.success(mapOf(
+                        "message" to preferences.getString(ForegroundSyncService.RESULT_MESSAGE, "Synchronization ended."),
+                        "success" to preferences.getBoolean(ForegroundSyncService.RESULT_SUCCESS, false),
+                        "sampleCount" to preferences.getInt(ForegroundSyncService.RESULT_SAMPLE_COUNT, 0),
+                    ))
                     return@setMethodCallHandler
                 }
                 if (call.method == "cancelForegroundSync") {

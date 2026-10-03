@@ -36,6 +36,7 @@ BLECharacteristic* pSensCharacteristic = NULL;
 BLECharacteristic* pSettingsCharacteristic = NULL;
 BLECharacteristic* pHistoryCharacteristic = NULL;
 BLECharacteristic* pHistoryPage2Characteristic = NULL;
+BLECharacteristic* pHistoryPage3Characteristic = NULL;
 BLECharacteristic *pTxCharacteristic, *pRxCharacteristic;
 BLEAdvertising* pAdvertising = NULL;
 bool deviceConnected = false;
@@ -45,6 +46,15 @@ String tmp;
 char outBuffer[80];
 
 extern Logger logger;
+
+namespace {
+void setHistoryValue(BLECharacteristic* characteristic, uint8_t page) {
+  if (characteristic == NULL) return;
+  size_t length = 0;
+  uint8_t* snapshot = history_export_page(page, length);
+  characteristic->setValue(snapshot, length);
+}
+} // namespace
 
 #define BLE_DEVICE_NAME "bleUPS"
 #define UART_SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E" // UART service UUID
@@ -56,6 +66,10 @@ extern Logger logger;
 #define SETTINGS_CHARACTERISTIC_UUID "235fefc9-58fd-4f84-977a-9a72ae348007"
 #define HISTORY_CHARACTERISTIC_UUID  "e6aa2d53-4ed4-43a6-a799-18dbf6a6d3da"
 #define HISTORY_PAGE_2_CHARACTERISTIC_UUID "8e64f238-2ffc-4870-bd31-3358f3b5c82d"
+#define HISTORY_PAGE_3_CHARACTERISTIC_UUID "9b90738b-a4d4-4b4d-91e1-9d0a114c8c4f"
+
+// BLE advertising interval units are 0.625 ms: 1600 units = 1 second.
+constexpr uint16_t ADVERTISING_INTERVAL_UNITS = 1600;
 
 
 class MyServerCallbacks: public BLEServerCallbacks {
@@ -75,13 +89,11 @@ class MyCallbacks: public BLECharacteristicCallbacks {
         const String snapshot = configuration_export();
         pCharacteristic->setValue(snapshot.c_str());
       } else if (pCharacteristic == pHistoryCharacteristic) {
-        size_t length = 0;
-        uint8_t* snapshot = history_export_page(0, length);
-        pCharacteristic->setValue(snapshot, length);
+        setHistoryValue(pCharacteristic, 0);
       } else if (pCharacteristic == pHistoryPage2Characteristic) {
-        size_t length = 0;
-        uint8_t* snapshot = history_export_page(1, length);
-        pCharacteristic->setValue(snapshot, length);
+        setHistoryValue(pCharacteristic, 1);
+      } else if (pCharacteristic == pHistoryPage3Characteristic) {
+        setHistoryValue(pCharacteristic, 2);
       }
     }
 
@@ -96,6 +108,10 @@ void ble_setup() {
   if (pServer != NULL) return;
   // Create the BLE Device
   BLEDevice::init(BLE_DEVICE_NAME);
+  // The default advertising rate (20-40 ms) is unnecessarily expensive for
+  // an intermittently awake battery device. Keep advertisements discoverable
+  // while reducing radio activity, without changing connection TX power.
+  BLEDevice::setPower(ESP_PWR_LVL_P3, ESP_BLE_PWR_TYPE_ADV);
 
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
@@ -143,13 +159,32 @@ void ble_setup() {
                     );
   pHistoryPage2Characteristic->setCallbacks(new MyCallbacks());
 
+  pHistoryPage3Characteristic = pGpsService->createCharacteristic(
+                      HISTORY_PAGE_3_CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_READ
+                    );
+  pHistoryPage3Characteristic->setCallbacks(new MyCallbacks());
+
+  // Do not rely solely on the onRead callback. Some Android stacks can return
+  // the characteristic's initial cached value during an immediate post-write
+  // read; populate both pages before the first client connects.
+  ble_refresh_history();
+
   pGpsService->start();
   pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(UPS_SERVICE_UUID);
   pAdvertising->addServiceUUID(UART_SERVICE_UUID);
+  pAdvertising->setMinInterval(ADVERTISING_INTERVAL_UNITS);
+  pAdvertising->setMaxInterval(ADVERTISING_INTERVAL_UNITS);
   pAdvertising->setScanResponse(true);
   BLEDevice::startAdvertising();
   logger.print("BLE+");
+}
+
+void ble_refresh_history() {
+  setHistoryValue(pHistoryCharacteristic, 0);
+  setHistoryValue(pHistoryPage2Characteristic, 1);
+  setHistoryValue(pHistoryPage3Characteristic, 2);
 }
 
 void ble_uart_send(const char *message) {
@@ -182,17 +217,18 @@ void ble_advertise_status(uint16_t voltage, uint16_t externalSupplyVoltage,
 
   // Legacy BLE advertising is limited to 31 bytes. Keep the positional payload
   // compact enough to carry both voltage metrics:
-  // FF FF <battery mV>;<switch>;<low battery>;<BLE>;<Wi-Fi>;<external mV>
+  // FF FF <battery mV>;<switch>;<low battery>;<BLE>;<Wi-Fi>;<external mV>;<time synced>
   // FF FF is the Bluetooth SIG test/internal company identifier; do not use
   // it for a commercial product without replacing it with an assigned ID.
   char status[48];
-  snprintf(status, sizeof(status), "\xFF\xFF%u;%u;%u;%u;%u;%u",
+  snprintf(status, sizeof(status), "\xFF\xFF%u;%u;%u;%u;%u;%u;%u",
            voltage,
            switchOn ? 1 : 0,
            lowBattery ? 1 : 0,
            deviceConnected ? 1 : 0,
            wifiConnected ? 1 : 0,
-           externalSupplyVoltage);
+           externalSupplyVoltage,
+           configuration_clock_is_known() ? 1 : 0);
 
   BLEAdvertisementData advertisementData;
   advertisementData.setFlags(0x06);
@@ -232,6 +268,7 @@ void ble_stop() {
   pSettingsCharacteristic = NULL;
   pHistoryCharacteristic = NULL;
   pHistoryPage2Characteristic = NULL;
+  pHistoryPage3Characteristic = NULL;
   pTxCharacteristic = NULL;
   pRxCharacteristic = NULL;
   BLEDevice::deinit();

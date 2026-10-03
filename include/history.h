@@ -5,9 +5,10 @@
 // Retained across deep-sleep resets, but intentionally lost on full power loss.
 // 100 packed records occupy about 1.1 KiB of RTC slow memory.
 constexpr uint8_t RTC_HISTORY_CAPACITY = 100;
-// ESP32 Bluedroid permits at most 600 bytes per characteristic value. A page
-// of 50 records is 554 bytes including its four-byte header.
-constexpr uint8_t RTC_HISTORY_PAGE_CAPACITY = 50;
+// A BLE GATT characteristic value is limited to 512 bytes. A page of 45
+// records occupies 499 bytes including its four-byte header; three pages hold
+// all 100 retained records.
+constexpr uint8_t RTC_HISTORY_PAGE_CAPACITY = 45;
 
 struct __attribute__((packed)) VoltageHistoryRecord {
     uint32_t sequence;
@@ -19,6 +20,11 @@ struct __attribute__((packed)) VoltageHistoryRecord {
 static_assert(sizeof(VoltageHistoryRecord) == 11, "History record must stay compact.");
 
 void history_begin();
+// Number of records currently retained in RTC slow memory.
+uint8_t history_count();
+// Discards retained records. Used when the phone establishes the first valid
+// clock, so later history always has a real timestamp.
+void history_clear();
 void history_append(uint16_t millivolts, bool lowBattery, bool loadOn, bool measurementValid,
                     uint32_t epochSeconds);
 // Binary chronological page: version, page count, page index, page total, then records.

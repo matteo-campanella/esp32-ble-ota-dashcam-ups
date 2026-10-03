@@ -26,6 +26,8 @@ import android.os.PowerManager
 import android.util.Base64
 import androidx.core.app.NotificationCompat
 import java.nio.charset.StandardCharsets
+import java.text.DateFormat
+import java.util.Date
 import java.util.UUID
 
 /**
@@ -39,14 +41,21 @@ class ForegroundSyncService : Service() {
         const val ACTION_CANCEL = "com.example.ups_dashcam_monitor.CANCEL_SYNC"
         private const val CHANNEL_ID = "ups_ble_sync"
         private const val NOTIFICATION_ID = 7102
+        private const val COMPLETION_CHANNEL_ID = "ups_ble_sync_complete"
+        private const val COMPLETION_NOTIFICATION_ID = 7103
         private const val WAIT_TIMEOUT_MS = 15 * 60 * 1000L
         private val SETTINGS_SERVICE_UUID: UUID = UUID.fromString("d96011fc-8ab0-42d9-93bb-ae202331297a")
         private val SETTINGS_UUID: UUID = UUID.fromString("235fefc9-58fd-4f84-977a-9a72ae348007")
         private val HISTORY_UUID: UUID = UUID.fromString("e6aa2d53-4ed4-43a6-a799-18dbf6a6d3da")
         private val HISTORY_PAGE_2_UUID: UUID = UUID.fromString("8e64f238-2ffc-4870-bd31-3358f3b5c82d")
+        private val HISTORY_PAGE_3_UUID: UUID = UUID.fromString("9b90738b-a4d4-4b4d-91e1-9d0a114c8c4f")
         const val HISTORY_PREFERENCES = "ups_synced_history"
         const val HISTORY_DATA = "data"
         const val HISTORY_RECEIVED_AT = "receivedAt"
+        const val RESULT_PREFERENCES = "ups_foreground_sync_result"
+        const val RESULT_MESSAGE = "message"
+        const val RESULT_SUCCESS = "success"
+        const val RESULT_SAMPLE_COUNT = "sampleCount"
         @Volatile var isActive = false
     }
 
@@ -57,11 +66,14 @@ class ForegroundSyncService : Service() {
     private var rxCharacteristic: BluetoothGattCharacteristic? = null
     private var historyCharacteristic: BluetoothGattCharacteristic? = null
     private var historyPage2Characteristic: BluetoothGattCharacteristic? = null
+    private var historyPage3Characteristic: BluetoothGattCharacteristic? = null
     private var historyPage0 = ByteArray(0)
+    private var historyPage1 = ByteArray(0)
     private var targetDeviceId = ""
     private var commands: List<String> = emptyList()
     private var nextCommand = 0
     private var scanning = false
+    private var retryScheduled = false
     private var seenScanResults = 0
     private var finished = false
 
@@ -116,6 +128,36 @@ class ForegroundSyncService : Service() {
             if (wakeLock.isHeld) wakeLock.release()
         }
         cpuWakeLock = null
+    }
+
+    private fun mergeHistoryPages(first: ByteArray, second: ByteArray, third: ByteArray): ByteArray? {
+        fun recordBytes(page: ByteArray, expectedPage: Int): ByteArray? {
+            if (page.size < 4 || page[0].toInt() != 1 || (page[2].toInt() and 0xFF) != expectedPage) {
+                return null
+            }
+            val count = page[1].toInt() and 0xFF
+            val length = 4 + count * 11
+            return if (count <= 45 && page.size >= length) page.copyOfRange(4, length) else null
+        }
+
+        val firstRecords = recordBytes(first, 0) ?: return null
+        val secondRecords = recordBytes(second, 1) ?: return null
+        val thirdRecords = recordBytes(third, 2) ?: return null
+        val count = (firstRecords.size + secondRecords.size + thirdRecords.size) / 11
+        if (count > 100) return null
+        return ByteArray(4 + firstRecords.size + secondRecords.size + thirdRecords.size).also { combined ->
+            combined[0] = 1
+            combined[1] = count.toByte()
+            System.arraycopy(firstRecords, 0, combined, 4, firstRecords.size)
+            System.arraycopy(secondRecords, 0, combined, 4 + firstRecords.size, secondRecords.size)
+            System.arraycopy(
+                thirdRecords,
+                0,
+                combined,
+                4 + firstRecords.size + secondRecords.size,
+                thirdRecords.size,
+            )
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -178,25 +220,26 @@ class ForegroundSyncService : Service() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (finished) return
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                finish("BLE connection failed ($status).")
+                retryFromBleFailure("BLE connection failed ($status)")
             } else if (newState == android.bluetooth.BluetoothProfile.STATE_CONNECTED) {
                 updateNotification("Connected; discovering ESP32 services…")
                 gatt.discoverServices()
             } else if (newState == android.bluetooth.BluetoothProfile.STATE_DISCONNECTED) {
-                finish("BLE disconnected before synchronization completed.")
+                retryFromBleFailure("BLE disconnected before synchronization completed")
             }
         }
 
         @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                finish("Could not discover ESP32 BLE services.")
+                retryFromBleFailure("Could not discover ESP32 BLE services ($status)")
                 return
             }
             val service: BluetoothGattService? = gatt.getService(SETTINGS_SERVICE_UUID)
             rxCharacteristic = service?.getCharacteristic(SETTINGS_UUID)
             historyCharacteristic = service?.getCharacteristic(HISTORY_UUID)
             historyPage2Characteristic = service?.getCharacteristic(HISTORY_PAGE_2_UUID)
+            historyPage3Characteristic = service?.getCharacteristic(HISTORY_PAGE_3_UUID)
             if (rxCharacteristic == null) {
                 finish("The ESP32 Settings characteristic was not found.")
                 return
@@ -211,7 +254,7 @@ class ForegroundSyncService : Service() {
             status: Int,
         ) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                finish("ESP32 rejected a configuration command ($status).")
+                retryFromBleFailure("Configuration write failed ($status)")
                 return
             }
             writeNextCommand()
@@ -223,9 +266,13 @@ class ForegroundSyncService : Service() {
             value: ByteArray,
             status: Int,
         ) {
-            if (finished || (characteristic.uuid != HISTORY_UUID && characteristic.uuid != HISTORY_PAGE_2_UUID)) return
+            if (finished ||
+                (characteristic.uuid != HISTORY_UUID &&
+                    characteristic.uuid != HISTORY_PAGE_2_UUID &&
+                    characteristic.uuid != HISTORY_PAGE_3_UUID)
+            ) return
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                finish("Settings synchronized; voltage history read failed ($status).")
+                retryFromBleFailure("Voltage history read failed ($status)")
                 return
             }
             if (characteristic.uuid == HISTORY_UUID) {
@@ -235,16 +282,30 @@ class ForegroundSyncService : Service() {
                 if (pageCount > 1 && secondPage != null) {
                     updateNotification("Retrieving remaining retained voltage history…")
                     if (!gatt.readCharacteristic(secondPage)) {
-                        finish("Settings synchronized; remaining voltage history was unavailable.")
+                        retryFromBleFailure("Remaining voltage history was unavailable")
                     }
                     return
                 }
                 persistHistory(value)
                 return
             }
-            val combined = mergeHistoryPages(historyPage0, value)
+            if (characteristic.uuid == HISTORY_PAGE_2_UUID && historyPage0.size >= 4 &&
+                (historyPage0[3].toInt() and 0xFF) > 2
+            ) {
+                historyPage1 = value
+                val thirdPage = historyPage3Characteristic
+                if (thirdPage == null || !gatt.readCharacteristic(thirdPage)) {
+                    retryFromBleFailure("Final voltage history page was unavailable")
+                }
+                return
+            }
+            val combined = if (characteristic.uuid == HISTORY_PAGE_3_UUID) {
+                mergeHistoryPages(historyPage0, historyPage1, value)
+            } else {
+                mergeHistoryPages(historyPage0, value)
+            }
             if (combined == null) {
-                finish("Settings synchronized; retained voltage history was malformed.")
+                retryFromBleFailure("Retained voltage history was malformed")
                 return
             }
             persistHistory(combined)
@@ -255,7 +316,16 @@ class ForegroundSyncService : Service() {
                 .putString(HISTORY_DATA, Base64.encodeToString(value, Base64.NO_WRAP))
                 .putLong(HISTORY_RECEIVED_AT, System.currentTimeMillis() / 1000L)
                 .apply()
-            finish("Settings and retained voltage history synchronized.")
+            val count = if (value.size >= 2) value[1].toInt() and 0xFF else 0
+            finish(
+                if (count == 0) {
+                    "Time synchronized. Samples will be available after the next wake cycle."
+                } else {
+                    "Settings and $count retained voltage samples synchronized."
+                },
+                success = true,
+                sampleCount = count,
+            )
         }
     }
 
@@ -266,7 +336,7 @@ class ForegroundSyncService : Service() {
             }
             val count = page[1].toInt() and 0xFF
             val length = 4 + count * 11
-            return if (count <= 50 && page.size >= length) page.copyOfRange(4, length) else null
+            return if (count <= 45 && page.size >= length) page.copyOfRange(4, length) else null
         }
 
         val firstRecords = recordBytes(first, 0) ?: return null
@@ -287,8 +357,9 @@ class ForegroundSyncService : Service() {
         if (nextCommand >= commands.size) {
             val history = historyCharacteristic
             historyPage0 = ByteArray(0)
+            historyPage1 = ByteArray(0)
             if (history == null || !gatt!!.readCharacteristic(history)) {
-                finish("Settings synchronized; voltage history was unavailable.")
+                retryFromBleFailure("Voltage history was unavailable")
             } else {
                 updateNotification("Retrieving retained voltage history…")
             }
@@ -302,7 +373,7 @@ class ForegroundSyncService : Service() {
         characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         characteristic.value = command.toByteArray(StandardCharsets.UTF_8)
         if (!gatt!!.writeCharacteristic(characteristic)) {
-            finish("Could not send configuration to the ESP32.")
+            retryFromBleFailure("Could not send configuration to the ESP32")
         }
     }
 
@@ -313,10 +384,38 @@ class ForegroundSyncService : Service() {
     }
 
     @SuppressLint("MissingPermission")
-    private fun finish(message: String) {
+    private fun retryFromBleFailure(reason: String) {
+        if (finished || retryScheduled) return
+        retryScheduled = true
+        updateNotification("$reason; waiting for the next ESP32 advertisement…")
+        stopScan()
+        gatt?.disconnect()
+        gatt?.close()
+        gatt = null
+        rxCharacteristic = null
+        historyCharacteristic = null
+        historyPage2Characteristic = null
+        historyPage3Characteristic = null
+        historyPage0 = ByteArray(0)
+        historyPage1 = ByteArray(0)
+        nextCommand = 0
+        handler.postDelayed({
+            retryScheduled = false
+            if (!finished) startScan()
+        }, 1000L)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun finish(message: String, success: Boolean = false, sampleCount: Int = 0) {
         if (finished) return
         finished = true
         isActive = false
+        retryScheduled = false
+        getSharedPreferences(RESULT_PREFERENCES, MODE_PRIVATE).edit()
+            .putString(RESULT_MESSAGE, message)
+            .putBoolean(RESULT_SUCCESS, success)
+            .putInt(RESULT_SAMPLE_COUNT, sampleCount)
+            .apply()
         releaseCpuWakeLock()
         handler.removeCallbacks(timeout)
         stopScan()
@@ -324,6 +423,7 @@ class ForegroundSyncService : Service() {
         gatt?.close()
         gatt = null
         updateNotification(message)
+        if (success) postSuccessfulCompletion(message)
         handler.postDelayed({ stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }, 1500)
     }
 
@@ -350,10 +450,33 @@ class ForegroundSyncService : Service() {
         .setOnlyAlertOnce(true)
         .build()
 
+    private fun postSuccessfulCompletion(message: String) {
+        val completedAt = DateFormat.getDateTimeInstance(
+            DateFormat.MEDIUM,
+            DateFormat.SHORT,
+        ).format(Date())
+        val notification = NotificationCompat.Builder(this, COMPLETION_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setContentTitle("UPS Dashcam synchronized")
+            .setContentText("$completedAt — $message")
+            .setStyle(NotificationCompat.BigTextStyle().bigText("$completedAt — $message"))
+            .setAutoCancel(true)
+            .build()
+        getSystemService(NotificationManager::class.java)
+            .notify(COMPLETION_NOTIFICATION_ID, notification)
+    }
+
     private fun createChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(CHANNEL_ID, "UPS BLE synchronization", NotificationManager.IMPORTANCE_LOW)
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+            val completionChannel = NotificationChannel(
+                COMPLETION_CHANNEL_ID,
+                "UPS BLE synchronization results",
+                NotificationManager.IMPORTANCE_DEFAULT,
+            )
+            getSystemService(NotificationManager::class.java)
+                .createNotificationChannel(completionChannel)
         }
     }
 

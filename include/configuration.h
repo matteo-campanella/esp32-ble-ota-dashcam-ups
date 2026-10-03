@@ -19,8 +19,12 @@ struct OnInterval {
 };
 
 struct DeviceConfiguration {
+    // Below this level the device uses the most conservative awake/sleep
+    // timings. It must not exceed the regular battery-off threshold.
+    uint16_t veryLowBatteryMillivolts = 3000;
     uint16_t lowBatteryMillivolts = 3300;
     uint16_t recoveryMillivolts = 3600;
+    uint16_t externalSupplyHighMillivolts = 11000;
     LoadOverride overrideMode = LoadOverride::Calendar;
     bool calendarEnabled = false; // false is the safe, backwards-compatible always-on default.
     int16_t utcOffsetMinutes = 0;
@@ -41,14 +45,16 @@ bool configuration_load_is_allowed();
 uint32_t configuration_seconds_until_transition();
 
 // Complete, authoritative snapshot for the BLE Settings characteristic.
-// C1,<low>,<recovery>,<mode>,<calendar>,<UTC offset>,<start:end> x 28
+// C3,<very-low>,<low>,<recovery>,<external-high>,<mode>,<calendar>,<UTC offset>,<start:end> x 28
 String configuration_export();
 
 // Handles compact BLE/UART configuration commands. Returns true if the command
 // belongs to this protocol and puts a concise reply in response.
 // T,<epoch>,<UTC offset minutes>  synchronize time
 // M,<0|1|2>                       calendar / force on / force off
-// B,<low mV>,<recovery mV>        battery thresholds
+// B,<low mV>,<recovery mV>        battery off/on thresholds
+// V,<very low mV>                 very-low battery threshold
+// X,<external supply mV>           external-supply high trigger
 // E,<0|1>                         calendar disabled / enabled
 // I,<day>,<slot>,<start>,<end>    weekly on interval; -1,-1 disables a slot
 bool configuration_handle_command(const String& command, String& response);

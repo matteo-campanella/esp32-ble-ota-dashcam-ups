@@ -28,6 +28,16 @@ void history_begin() {
     rtcHistory.magic = HISTORY_MAGIC;
 }
 
+uint8_t history_count() {
+    history_begin();
+    return rtcHistory.count;
+}
+
+void history_clear() {
+    memset(&rtcHistory, 0, sizeof(rtcHistory));
+    rtcHistory.magic = HISTORY_MAGIC;
+}
+
 void history_append(uint16_t millivolts, bool lowBattery, bool loadOn, bool measurementValid,
                     uint32_t epochSeconds) {
     VoltageHistoryRecord& record = rtcHistory.records[rtcHistory.next];

@@ -1,23 +1,35 @@
 #include "configuration.h"
+#include "history.h"
 
 #include <Preferences.h>
 #include <esp_attr.h>
+#include <string.h>
 #include <time.h>
 
 namespace {
 constexpr char CONFIG_NAMESPACE[] = "upsconfig";
 constexpr char INTERVALS_KEY[] = "intervals";
+constexpr uint32_t RTC_CLOCK_MAGIC = 0x55505343UL; // "UPSC"
 
-RTC_DATA_ATTR bool rtcClockKnown = false;
-RTC_DATA_ATTR uint32_t rtcEpochAtBoot = 0;
-RTC_DATA_ATTR uint32_t rtcPreviousSleepSeconds = 0;
+// Do not give this RTC object a C++ initializer. The ESP32 startup code can
+// reapply initialized RTC data on reset; an uninitialized retained block plus
+// a magic value preserves state across timer deep-sleep wakes.
+struct RtcClockState {
+    uint32_t magic;
+    uint32_t epochAtBoot;
+    uint32_t previousSleepSeconds;
+    bool known;
+};
+RTC_DATA_ATTR RtcClockState rtcClock;
 unsigned long runtimeBootMillis = 0;
 
 void saveConfiguration() {
     Preferences preferences;
     if (!preferences.begin(CONFIG_NAMESPACE, false)) return;
+    preferences.putUShort("veryLow", deviceConfiguration.veryLowBatteryMillivolts);
     preferences.putUShort("low", deviceConfiguration.lowBatteryMillivolts);
     preferences.putUShort("recovery", deviceConfiguration.recoveryMillivolts);
+    preferences.putUShort("extHigh", deviceConfiguration.externalSupplyHighMillivolts);
     preferences.putUChar("override", static_cast<uint8_t>(deviceConfiguration.overrideMode));
     preferences.putBool("calendar", deviceConfiguration.calendarEnabled);
     preferences.putShort("utcOffset", deviceConfiguration.utcOffsetMinutes);
@@ -51,8 +63,10 @@ DeviceConfiguration deviceConfiguration;
 void configuration_begin(bool timerWake) {
     Preferences preferences;
     if (preferences.begin(CONFIG_NAMESPACE, true)) {
+        deviceConfiguration.veryLowBatteryMillivolts = preferences.getUShort("veryLow", 3000);
         deviceConfiguration.lowBatteryMillivolts = preferences.getUShort("low", 3300);
         deviceConfiguration.recoveryMillivolts = preferences.getUShort("recovery", 3600);
+        deviceConfiguration.externalSupplyHighMillivolts = preferences.getUShort("extHigh", 11000);
         const uint8_t storedOverride = preferences.getUChar("override", 0);
         deviceConfiguration.overrideMode = storedOverride <= static_cast<uint8_t>(LoadOverride::ForceOff)
                                                ? static_cast<LoadOverride>(storedOverride)
@@ -66,26 +80,32 @@ void configuration_begin(bool timerWake) {
         preferences.end();
     }
 
+    if (rtcClock.magic != RTC_CLOCK_MAGIC) {
+        memset(&rtcClock, 0, sizeof(rtcClock));
+        rtcClock.magic = RTC_CLOCK_MAGIC;
+    }
+
     runtimeBootMillis = millis();
-    if (timerWake && rtcClockKnown) {
-        rtcEpochAtBoot += rtcPreviousSleepSeconds;
+    if (timerWake && rtcClock.known) {
+        rtcClock.epochAtBoot += rtcClock.previousSleepSeconds;
     } else if (!timerWake) {
         // A cold boot has no trustworthy clock, even though configuration survives in NVS.
-        rtcClockKnown = false;
-        rtcEpochAtBoot = 0;
+        rtcClock.known = false;
+        rtcClock.epochAtBoot = 0;
+        rtcClock.previousSleepSeconds = 0;
     }
 }
 
 void configuration_prepare_sleep(uint32_t seconds) {
-    if (rtcClockKnown) rtcEpochAtBoot = configuration_now_epoch();
-    rtcPreviousSleepSeconds = seconds;
+    if (rtcClock.known) rtcClock.epochAtBoot = configuration_now_epoch();
+    rtcClock.previousSleepSeconds = seconds;
 }
 
-bool configuration_clock_is_known() { return rtcClockKnown; }
+bool configuration_clock_is_known() { return rtcClock.known; }
 
 uint32_t configuration_now_epoch() {
-    if (!rtcClockKnown) return 0;
-    return rtcEpochAtBoot + ((millis() - runtimeBootMillis) / 1000UL);
+    if (!rtcClock.known) return 0;
+    return rtcClock.epochAtBoot + ((millis() - runtimeBootMillis) / 1000UL);
 }
 
 bool configuration_calendar_allows_on() {
@@ -141,10 +161,14 @@ uint32_t configuration_seconds_until_transition() {
 }
 
 String configuration_export() {
-    String value = "C1,";
+    String value = "C3,";
+    value += deviceConfiguration.veryLowBatteryMillivolts;
+    value += ',';
     value += deviceConfiguration.lowBatteryMillivolts;
     value += ',';
     value += deviceConfiguration.recoveryMillivolts;
+    value += ',';
+    value += deviceConfiguration.externalSupplyHighMillivolts;
     value += ',';
     value += static_cast<uint8_t>(deviceConfiguration.overrideMode);
     value += ',';
@@ -172,12 +196,20 @@ bool configuration_handle_command(const String& command, String& response) {
         if (values[0] < 1700000000L || values[1] < -840 || values[1] > 840) {
             response = "CFG ERR TIME";
         } else {
-            rtcEpochAtBoot = static_cast<uint32_t>(values[0]);
+            const bool firstClockSynchronization = !rtcClock.known;
+            rtcClock.epochAtBoot = static_cast<uint32_t>(values[0]);
             runtimeBootMillis = millis();
-            rtcClockKnown = true;
+            rtcClock.known = true;
             deviceConfiguration.utcOffsetMinutes = static_cast<int16_t>(values[1]);
             saveConfiguration();
-            response = "CFG OK TIME";
+            if (firstClockSynchronization) {
+                // The current cycle was measured before a trustworthy time was
+                // available. Do not export it (or older zero-time records).
+                history_clear();
+                response = "CFG OK TIME FIRST";
+            } else {
+                response = "CFG OK TIME";
+            }
         }
         return true;
     }
@@ -200,6 +232,28 @@ bool configuration_handle_command(const String& command, String& response) {
             deviceConfiguration.recoveryMillivolts = static_cast<uint16_t>(values[1]);
             saveConfiguration();
             response = "CFG OK BAT";
+        }
+        return true;
+    }
+
+    if (command.startsWith("V,") && splitNumbers(command.substring(2), values, 1)) {
+        if (values[0] < 2000 || values[0] > deviceConfiguration.lowBatteryMillivolts) {
+            response = "CFG ERR VLOW";
+        } else {
+            deviceConfiguration.veryLowBatteryMillivolts = static_cast<uint16_t>(values[0]);
+            saveConfiguration();
+            response = "CFG OK VLOW";
+        }
+        return true;
+    }
+
+    if (command.startsWith("X,") && splitNumbers(command.substring(2), values, 1)) {
+        if (values[0] < 1000 || values[0] > 20000) {
+            response = "CFG ERR EXT";
+        } else {
+            deviceConfiguration.externalSupplyHighMillivolts = static_cast<uint16_t>(values[0]);
+            saveConfiguration();
+            response = "CFG OK EXT";
         }
         return true;
     }

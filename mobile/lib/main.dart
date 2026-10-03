@@ -44,6 +44,7 @@ class UpsStatus {
     required this.lowBattery,
     required this.bleConnected,
     required this.wifiConnected,
+    required this.timeSynchronized,
     required this.rssi,
   });
 
@@ -55,9 +56,12 @@ class UpsStatus {
   final bool lowBattery;
   final bool bleConnected;
   final bool wifiConnected;
+  // Null is used for advertisements emitted by older firmware that did not
+  // expose its retained-clock state.
+  final bool? timeSynchronized;
   final int rssi;
 
-  // Firmware payload: <battery mV>;<switch>;<low battery>;<BLE>;<Wi-Fi>;<external mV>
+  // Firmware payload: <battery mV>;<switch>;<low battery>;<BLE>;<Wi-Fi>;<external mV>;<time synced>
   static UpsStatus? fromAdvertisement({
     required String deviceId,
     required List<int> bytes,
@@ -66,7 +70,7 @@ class UpsStatus {
   }) {
     final text = utf8.decode(bytes, allowMalformed: true);
     final match = RegExp(
-      r'^(\d+);([01]);([01]);([01]);([01]);(\d+)$',
+      r'^(\d+);([01]);([01]);([01]);([01]);(\d+)(?:;([01]))?$',
     ).firstMatch(text);
     final legacyMatch = RegExp(
       r'V=(\d+);S=([01]);L=([01]);B=([01]);W=([01])',
@@ -82,6 +86,9 @@ class UpsStatus {
       lowBattery: fields.group(3) == '1',
       bleConnected: fields.group(4) == '1',
       wifiConnected: fields.group(5) == '1',
+      timeSynchronized: match == null
+          ? null
+          : (fields.group(7) == null ? null : fields.group(7) == '1'),
       rssi: rssi,
     );
   }
@@ -95,6 +102,7 @@ class UpsStatus {
     'lowBattery': lowBattery,
     'bleConnected': bleConnected,
     'wifiConnected': wifiConnected,
+    'timeSynchronized': timeSynchronized,
     'rssi': rssi,
   };
 
@@ -107,6 +115,7 @@ class UpsStatus {
     lowBattery: json['lowBattery'] as bool,
     bleConnected: json['bleConnected'] as bool,
     wifiConnected: json['wifiConnected'] as bool,
+    timeSynchronized: json['timeSynchronized'] as bool?,
     rssi: json['rssi'] as int,
   );
 }
@@ -167,7 +176,9 @@ class SyncedVoltageSample {
   });
 
   final int sequence;
-  final DateTime receivedAt;
+  // Null means the ESP32 recorded the sample before receiving a valid phone
+  // time. Such samples are retained for diagnostics but cannot be charted.
+  final DateTime? receivedAt;
   final int voltageMv;
   final bool lowBattery;
   final bool switchOn;
@@ -194,15 +205,14 @@ class _HistoryWireRecord {
 
 class SyncHistoryStore {
   static const _channel = MethodChannel('ups_dashcam_monitor/foreground_sync');
-  static const _normalCycleSeconds = 10;
-  static const _lowBatteryCycleSeconds = 600;
+
+  Future<void> clear() => _channel.invokeMethod<void>('clearSyncedHistory');
 
   Future<List<SyncedVoltageSample>> load() async {
     final result = await _channel.invokeMethod<Map<Object?, Object?>>(
       'getSyncedHistory',
     );
     final encoded = result?['data'] as String? ?? '';
-    final receivedAt = result?['receivedAt'] as int? ?? 0;
     if (encoded.isEmpty) return [];
     try {
       final bytes = base64Decode(encoded);
@@ -213,7 +223,6 @@ class SyncHistoryStore {
       final count = bytes[1];
       if (bytes.length < 4 + count * 11) return [];
       final data = ByteData.sublistView(Uint8List.fromList(bytes));
-      final fallback = DateTime.fromMillisecondsSinceEpoch(receivedAt * 1000);
       final records = List<_HistoryWireRecord>.generate(count, (index) {
         final offset = 4 + index * 11;
         return _HistoryWireRecord(
@@ -223,29 +232,13 @@ class SyncHistoryStore {
           flags: data.getUint8(offset + 10),
         );
       });
-      final timestamps = List<DateTime>.filled(count, fallback);
-      for (var index = count - 1; index >= 0; index--) {
-        final record = records[index];
-        if (record.epochSeconds != 0) {
-          timestamps[index] = DateTime.fromMillisecondsSinceEpoch(
-            record.epochSeconds * 1000,
-          );
-        } else if (index == count - 1) {
-          timestamps[index] = fallback;
-        } else {
-          final cycleSeconds = record.lowBattery
-              ? _lowBatteryCycleSeconds
-              : _normalCycleSeconds;
-          timestamps[index] = timestamps[index + 1].subtract(
-            Duration(seconds: cycleSeconds),
-          );
-        }
-      }
       return List<SyncedVoltageSample>.generate(count, (index) {
         final record = records[index];
         return SyncedVoltageSample(
           sequence: record.sequence,
-          receivedAt: timestamps[index],
+          receivedAt: record.epochSeconds == 0
+              ? null
+              : DateTime.fromMillisecondsSinceEpoch(record.epochSeconds * 1000),
           voltageMv: record.voltageMv,
           lowBattery: record.lowBattery,
           switchOn: record.switchOn,
@@ -260,8 +253,10 @@ class SyncHistoryStore {
 
 class DeviceSettings {
   const DeviceSettings({
+    this.veryLowBatteryMv = 3000,
     this.lowBatteryMv = 3300,
     this.recoveryMv = 3600,
+    this.externalSupplyHighMv = 11000,
     this.overrideMode = LoadOverride.calendar,
     this.calendarEnabled = false,
     required this.intervals,
@@ -271,15 +266,19 @@ class DeviceSettings {
     intervals: List<List<WeeklyInterval>>.generate(7, (_) => const []),
   );
 
+  final int veryLowBatteryMv;
   final int lowBatteryMv;
   final int recoveryMv;
+  final int externalSupplyHighMv;
   final LoadOverride overrideMode;
   final bool calendarEnabled;
   final List<List<WeeklyInterval>> intervals;
 
   Map<String, Object> toJson() => {
+    'veryLowBatteryMv': veryLowBatteryMv,
     'lowBatteryMv': lowBatteryMv,
     'recoveryMv': recoveryMv,
+    'externalSupplyHighMv': externalSupplyHighMv,
     'overrideMode': overrideMode.index,
     'calendarEnabled': calendarEnabled,
     'intervals': intervals
@@ -303,8 +302,10 @@ class DeviceSettings {
       LoadOverride.values.length - 1,
     );
     return DeviceSettings(
+      veryLowBatteryMv: json['veryLowBatteryMv'] as int? ?? 3000,
       lowBatteryMv: json['lowBatteryMv'] as int? ?? 3300,
       recoveryMv: json['recoveryMv'] as int? ?? 3600,
+      externalSupplyHighMv: json['externalSupplyHighMv'] as int? ?? 11000,
       overrideMode: LoadOverride.values[mode],
       calendarEnabled: json['calendarEnabled'] as bool? ?? false,
       intervals: days,
@@ -313,13 +314,17 @@ class DeviceSettings {
 
   factory DeviceSettings.fromRegister(String value) {
     final fields = value.trim().split(',');
-    if (fields.length != 34 || fields.first != 'C1') {
+    final isV1 = fields.length == 34 && fields.first == 'C1';
+    final isV2 = fields.length == 35 && fields.first == 'C2';
+    final isV3 = fields.length == 36 && fields.first == 'C3';
+    if (!isV1 && !isV2 && !isV3) {
       throw const FormatException('Invalid ESP32 settings register.');
     }
+    final intervalOffset = isV3 ? 8 : (isV2 ? 7 : 6);
     final intervals = List<List<WeeklyInterval>>.generate(7, (_) => []);
     for (var day = 0; day < 7; day++) {
       for (var slot = 0; slot < 4; slot++) {
-        final range = fields[6 + day * 4 + slot].split(':');
+        final range = fields[intervalOffset + day * 4 + slot].split(':');
         if (range.length != 2)
           throw const FormatException('Invalid calendar interval.');
         final start = int.parse(range[0]);
@@ -330,12 +335,18 @@ class DeviceSettings {
           );
       }
     }
-    final mode = int.parse(fields[3]).clamp(0, LoadOverride.values.length - 1);
+    final mode = int.parse(
+      fields[isV3 ? 5 : (isV2 ? 4 : 3)],
+    ).clamp(0, LoadOverride.values.length - 1);
     return DeviceSettings(
-      lowBatteryMv: int.parse(fields[1]),
-      recoveryMv: int.parse(fields[2]),
+      veryLowBatteryMv: isV3 ? int.parse(fields[1]) : 3000,
+      lowBatteryMv: int.parse(fields[isV3 ? 2 : 1]),
+      recoveryMv: int.parse(fields[isV3 ? 3 : 2]),
+      externalSupplyHighMv: isV3
+          ? int.parse(fields[4])
+          : (isV2 ? int.parse(fields[3]) : 11000),
       overrideMode: LoadOverride.values[mode],
-      calendarEnabled: fields[4] == '1',
+      calendarEnabled: fields[isV3 ? 6 : (isV2 ? 5 : 4)] == '1',
       intervals: intervals,
     );
   }
@@ -373,6 +384,8 @@ class BleConfigurator {
       'E,0',
       'T,${now.millisecondsSinceEpoch ~/ 1000},${now.timeZoneOffset.inMinutes}',
       'B,${settings.lowBatteryMv},${settings.recoveryMv}',
+      'V,${settings.veryLowBatteryMv}',
+      'X,${settings.externalSupplyHighMv}',
       'M,${settings.overrideMode.index}',
     ];
     for (var day = 0; day < 7; day++) {
@@ -401,11 +414,46 @@ class BleConfigurator {
     });
   }
 
+  // This deliberately transfers time only. An automatic first sync must not
+  // overwrite configuration that may already have been set on the ESP32.
+  static Future<void> startInitialTimeSync(String deviceId) async {
+    final now = DateTime.now();
+    await _syncChannel.invokeMethod<void>('startForegroundSync', {
+      'deviceId': deviceId,
+      'commands': [
+        'T,${now.millisecondsSinceEpoch ~/ 1000},${now.timeZoneOffset.inMinutes}',
+      ],
+    });
+  }
+
   static Future<bool> isForegroundSyncActive() async =>
       await _syncChannel.invokeMethod<bool>('isForegroundSyncActive') ?? false;
 
+  static Future<_ForegroundSyncResult> foregroundSyncResult() async {
+    final result = await _syncChannel.invokeMethod<Map<Object?, Object?>>(
+      'getForegroundSyncResult',
+    );
+    return _ForegroundSyncResult(
+      message: result?['message'] as String? ?? 'Synchronization ended.',
+      success: result?['success'] as bool? ?? false,
+      sampleCount: result?['sampleCount'] as int? ?? 0,
+    );
+  }
+
   static Future<void> cancelForegroundSync() =>
       _syncChannel.invokeMethod<void>('cancelForegroundSync');
+}
+
+class _ForegroundSyncResult {
+  const _ForegroundSyncResult({
+    required this.message,
+    required this.success,
+    required this.sampleCount,
+  });
+
+  final String message;
+  final bool success;
+  final int sampleCount;
 }
 
 class MonitorPage extends StatefulWidget {
@@ -428,6 +476,7 @@ class _MonitorPageState extends State<MonitorPage> with WidgetsBindingObserver {
   bool _scanning = false;
   bool _keepScreenAwake = false;
   bool _appIsForeground = true;
+  final Set<String> _automaticTimeSyncDevices = {};
 
   UpsStatus? get _latest =>
       _selectedDeviceId == null ? null : _latestByDevice[_selectedDeviceId];
@@ -587,13 +636,53 @@ class _MonitorPageState extends State<MonitorPage> with WidgetsBindingObserver {
     if (shouldPersist) {
       unawaited(_store.save(_history));
     }
+    if (received.timeSynchronized == false && _appIsForeground) {
+      unawaited(_startAutomaticInitialTimeSync(received.deviceId));
+    }
+  }
+
+  Future<void> _startAutomaticInitialTimeSync(String deviceId) async {
+    if (!_automaticTimeSyncDevices.add(deviceId)) return;
+    var stoppedScan = false;
+    try {
+      if (await BleConfigurator.isForegroundSyncActive()) return;
+      await _stopScan();
+      stoppedScan = true;
+      await BleConfigurator.startInitialTimeSync(deviceId);
+
+      // The foreground service owns scanning until its bounded sync finishes.
+      // Wait before querying so Android has time to enter onStartCommand.
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      while (mounted && await BleConfigurator.isForegroundSyncActive()) {
+        await Future<void>.delayed(const Duration(seconds: 1));
+      }
+      if (!mounted) return;
+      final result = await BleConfigurator.foregroundSyncResult();
+      if (!result.success) {
+        setState(
+          () => _error =
+              'Automatic first time sync failed: ${result.message}. Open Device settings and tap Sync to ESP32 to retry.',
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(
+          () => _error =
+              'Could not start automatic first time sync: $error',
+        );
+      }
+    } finally {
+      _automaticTimeSyncDevices.remove(deviceId);
+      if (mounted && stoppedScan) await _startScan();
+    }
   }
 
   Future<void> _clearHistory() async {
-    await _store.clear();
+    await Future.wait([_store.clear(), _syncHistoryStore.clear()]);
     if (mounted) {
       setState(() {
         _history.clear();
+        _syncedHistory = [];
         _latestByDevice.clear();
         _selectedDeviceId = null;
       });
@@ -962,7 +1051,9 @@ class _SettingsPageState extends State<SettingsPage> {
     'Sunday',
   ];
   late final TextEditingController _lowController;
+  late final TextEditingController _veryLowController;
   late final TextEditingController _recoveryController;
+  late final TextEditingController _externalSupplyHighController;
   late LoadOverride _overrideMode;
   late bool _calendarEnabled;
   late List<List<WeeklyInterval>> _intervals;
@@ -981,8 +1072,14 @@ class _SettingsPageState extends State<SettingsPage> {
     _lowController = TextEditingController(
       text: widget.initialSettings.lowBatteryMv.toString(),
     );
+    _veryLowController = TextEditingController(
+      text: widget.initialSettings.veryLowBatteryMv.toString(),
+    );
     _recoveryController = TextEditingController(
       text: widget.initialSettings.recoveryMv.toString(),
+    );
+    _externalSupplyHighController = TextEditingController(
+      text: widget.initialSettings.externalSupplyHighMv.toString(),
     );
     _overrideMode = widget.initialSettings.overrideMode;
     _calendarEnabled = widget.initialSettings.calendarEnabled;
@@ -996,7 +1093,9 @@ class _SettingsPageState extends State<SettingsPage> {
   void dispose() {
     _syncStateTimer?.cancel();
     _lowController.dispose();
+    _veryLowController.dispose();
     _recoveryController.dispose();
+    _externalSupplyHighController.dispose();
     super.dispose();
   }
 
@@ -1012,11 +1111,16 @@ class _SettingsPageState extends State<SettingsPage> {
     final active = await BleConfigurator.isForegroundSyncActive();
     if (!mounted) return;
     if (_syncActive && !active) {
+      final result = await BleConfigurator.foregroundSyncResult();
+      if (!mounted) return;
       _syncStateTimer?.cancel();
       setState(() {
         _syncActive = false;
-        _syncMessage =
-            'Synchronization finished. Check the Android notification, then refresh history on the monitor screen.';
+        _syncMessage = result.success
+            ? result.sampleCount == 0
+                  ? '${result.message} 0 history samples synced with this phone.'
+                  : 'Synchronization finished. ${result.sampleCount} history ${result.sampleCount == 1 ? 'sample' : 'samples'} synced with this phone. Refresh history on the monitor screen.'
+            : 'Synchronization failed: ${result.message}';
       });
     } else if (!_syncActive && active) {
       setState(() => _syncActive = true);
@@ -1065,21 +1169,31 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> _send() async {
     final low = int.tryParse(_lowController.text);
+    final veryLow = int.tryParse(_veryLowController.text);
     final recovery = int.tryParse(_recoveryController.text);
-    if (low == null ||
+    final externalSupplyHigh = int.tryParse(_externalSupplyHighController.text);
+    if (veryLow == null ||
+        low == null ||
         recovery == null ||
+        externalSupplyHigh == null ||
+        veryLow < 2000 ||
+        veryLow > low ||
         low < 2500 ||
         recovery < low ||
-        recovery > 5500) {
+        recovery > 5500 ||
+        externalSupplyHigh < 1000 ||
+        externalSupplyHigh > 20000) {
       setState(
         () => _error =
-            'Use valid thresholds: low 2500–5000 mV and recovery at or above low.',
+            'Use valid thresholds: very low at least 2000 mV, low 2500–5000 mV, and recovery at or above low.',
       );
       return;
     }
     final settings = DeviceSettings(
+      veryLowBatteryMv: veryLow,
       lowBatteryMv: low,
       recoveryMv: recovery,
+      externalSupplyHighMv: externalSupplyHigh,
       overrideMode: _overrideMode,
       calendarEnabled: _calendarEnabled,
       intervals: _intervals
@@ -1180,6 +1294,18 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           const SizedBox(height: 12),
           TextField(
+            controller: _veryLowController,
+            enabled: !_controlsLocked,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(
+              labelText: 'Very-low battery threshold',
+              helperText:
+                  'Uses the most conservative awake/sleep timing below this voltage.',
+              suffixText: 'mV',
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
             controller: _lowController,
             enabled: !_controlsLocked,
             keyboardType: TextInputType.number,
@@ -1195,6 +1321,18 @@ class _SettingsPageState extends State<SettingsPage> {
             keyboardType: TextInputType.number,
             decoration: const InputDecoration(
               labelText: 'Battery-on threshold',
+              suffixText: 'mV',
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _externalSupplyHighController,
+            enabled: !_controlsLocked,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(
+              labelText: 'External-supply high trigger',
+              helperText:
+                  'Uses external awake/sleep timing above this voltage.',
               suffixText: 'mV',
             ),
           ),
@@ -1397,6 +1535,13 @@ class _StatusCard extends StatelessWidget {
                       : 'BLE advertising',
                   active: status!.bleConnected,
                 ),
+                if (status!.timeSynchronized != null)
+                  _StateChip(
+                    label: status!.timeSynchronized!
+                        ? 'Time synchronized'
+                        : 'Time sync needed',
+                    active: status!.timeSynchronized!,
+                  ),
               ],
             ),
             const SizedBox(height: 12),
@@ -1528,8 +1673,13 @@ class _VoltageChartPainter extends CustomPainter {
 
   List<_ChartPoint> _synchronizedPoints() =>
       synchronized
-          .where((sample) => sample.measurementValid && sample.voltageMv > 0)
-          .map((sample) => _ChartPoint(sample.receivedAt, sample.voltageMv))
+          .where(
+            (sample) =>
+                sample.measurementValid &&
+                sample.voltageMv > 0 &&
+                sample.receivedAt != null,
+          )
+          .map((sample) => _ChartPoint(sample.receivedAt!, sample.voltageMv))
           .toList()
         ..sort((a, b) => a.time.compareTo(b.time));
 
