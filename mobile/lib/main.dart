@@ -274,6 +274,18 @@ class DeviceSettings {
   final bool calendarEnabled;
   final List<List<WeeklyInterval>> intervals;
 
+  DeviceSettings copyWith({LoadOverride? overrideMode}) => DeviceSettings(
+    veryLowBatteryMv: veryLowBatteryMv,
+    lowBatteryMv: lowBatteryMv,
+    recoveryMv: recoveryMv,
+    externalSupplyHighMv: externalSupplyHighMv,
+    overrideMode: overrideMode ?? this.overrideMode,
+    calendarEnabled: calendarEnabled,
+    intervals: intervals
+        .map((day) => List<WeeklyInterval>.from(day))
+        .toList(),
+  );
+
   Map<String, Object> toJson() => {
     'veryLowBatteryMv': veryLowBatteryMv,
     'lowBatteryMv': lowBatteryMv,
@@ -426,6 +438,14 @@ class BleConfigurator {
     });
   }
 
+  static Future<void> startLoadOverride(
+    String deviceId,
+    LoadOverride overrideMode,
+  ) => _syncChannel.invokeMethod<void>('startForegroundSync', {
+    'deviceId': deviceId,
+    'commands': ['M,${overrideMode.index}'],
+  });
+
   static Future<bool> isForegroundSyncActive() async =>
       await _syncChannel.invokeMethod<bool>('isForegroundSyncActive') ?? false;
 
@@ -477,6 +497,8 @@ class _MonitorPageState extends State<MonitorPage> with WidgetsBindingObserver {
   bool _keepScreenAwake = false;
   bool _appIsForeground = true;
   final Set<String> _automaticTimeSyncDevices = {};
+  bool _loadOverrideSending = false;
+  String? _loadOverrideMessage;
 
   UpsStatus? get _latest =>
       _selectedDeviceId == null ? null : _latestByDevice[_selectedDeviceId];
@@ -677,6 +699,61 @@ class _MonitorPageState extends State<MonitorPage> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _setLoadOverride(LoadOverride overrideMode) async {
+    final deviceId = _selectedDeviceId;
+    if (deviceId == null || _loadOverrideSending) return;
+    if (await BleConfigurator.isForegroundSyncActive()) {
+      if (mounted) {
+        setState(
+          () => _error =
+              'Another ESP32 synchronization is already in progress.',
+        );
+      }
+      return;
+    }
+
+    var stoppedScan = false;
+    setState(() {
+      _error = null;
+      _loadOverrideSending = true;
+      _loadOverrideMessage =
+          'Waiting for the ESP32 to wake and apply the load override…';
+    });
+    try {
+      final current = await _settingsStore.load(deviceId);
+      await _stopScan();
+      stoppedScan = true;
+      await BleConfigurator.startLoadOverride(deviceId, overrideMode);
+
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      while (mounted && await BleConfigurator.isForegroundSyncActive()) {
+        await Future<void>.delayed(const Duration(seconds: 1));
+      }
+      if (!mounted) return;
+      final result = await BleConfigurator.foregroundSyncResult();
+      if (!result.success) {
+        setState(
+          () => _error = 'Load override failed: ${result.message}',
+        );
+        return;
+      }
+      await _settingsStore.save(deviceId, current.copyWith(overrideMode: overrideMode));
+      if (mounted) {
+        setState(
+          () => _loadOverrideMessage =
+              'Load is forced ${overrideMode == LoadOverride.forceOn ? 'ON' : 'OFF'}.',
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() => _error = 'Could not apply load override: $error');
+      }
+    } finally {
+      if (mounted) setState(() => _loadOverrideSending = false);
+      if (mounted && stoppedScan) await _startScan();
+    }
+  }
+
   Future<void> _clearHistory() async {
     await Future.wait([_store.clear(), _syncHistoryStore.clear()]);
     if (mounted) {
@@ -777,6 +854,57 @@ class _MonitorPageState extends State<MonitorPage> with WidgetsBindingObserver {
               ),
             const SizedBox(height: 12),
             _StatusCard(status: latest, scanning: _scanning),
+            const SizedBox(height: 12),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Immediate load control',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 4),
+                    const Text(
+                      'Applied during the next ESP32 awake BLE window. Force ON never overrides battery protection.',
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: FilledButton.icon(
+                            onPressed: latest == null || _loadOverrideSending
+                                ? null
+                                : () => _setLoadOverride(LoadOverride.forceOn),
+                            icon: const Icon(Icons.power),
+                            label: const Text('Force ON'),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: FilledButton.icon(
+                            style: FilledButton.styleFrom(
+                              backgroundColor: Theme.of(context).colorScheme.error,
+                              foregroundColor: Theme.of(context).colorScheme.onError,
+                            ),
+                            onPressed: latest == null || _loadOverrideSending
+                                ? null
+                                : () => _setLoadOverride(LoadOverride.forceOff),
+                            icon: const Icon(Icons.power_off),
+                            label: const Text('Force OFF'),
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (_loadOverrideMessage != null) ...[
+                      const SizedBox(height: 8),
+                      Text(_loadOverrideMessage!),
+                    ],
+                  ],
+                ),
+              ),
+            ),
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
               title: const Text('Keep screen awake while monitoring'),

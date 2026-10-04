@@ -43,7 +43,9 @@ class ForegroundSyncService : Service() {
         private const val NOTIFICATION_ID = 7102
         private const val COMPLETION_CHANNEL_ID = "ups_ble_sync_complete"
         private const val COMPLETION_NOTIFICATION_ID = 7103
-        private const val WAIT_TIMEOUT_MS = 15 * 60 * 1000L
+        // Very-low battery can sleep for one hour. Leave a small margin for
+        // boot, measurement, advertising, and the BLE connection.
+        private const val WAIT_TIMEOUT_MS = 65 * 60 * 1000L
         private val SETTINGS_SERVICE_UUID: UUID = UUID.fromString("d96011fc-8ab0-42d9-93bb-ae202331297a")
         private val SETTINGS_UUID: UUID = UUID.fromString("235fefc9-58fd-4f84-977a-9a72ae348007")
         private val HISTORY_UUID: UUID = UUID.fromString("e6aa2d53-4ed4-43a6-a799-18dbf6a6d3da")
@@ -317,8 +319,11 @@ class ForegroundSyncService : Service() {
                 .putLong(HISTORY_RECEIVED_AT, System.currentTimeMillis() / 1000L)
                 .apply()
             val count = if (value.size >= 2) value[1].toInt() and 0xFF else 0
+            val isLoadOverrideOnly = commands.size == 1 && commands.first().startsWith("M,")
             finish(
-                if (count == 0) {
+                if (isLoadOverrideOnly) {
+                    "Load override applied."
+                } else if (count == 0) {
                     "Time synchronized. Samples will be available after the next wake cycle."
                 } else {
                     "Settings and $count retained voltage samples synchronized."

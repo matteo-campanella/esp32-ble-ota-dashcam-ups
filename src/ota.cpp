@@ -1,7 +1,34 @@
 #include "ota.h"
 #include "ota_credentials.h"
+#include "configuration.h"
+
+#include <time.h>
 
 WiFiClient ota_client;
+
+bool ota_sync_time_ntp() {
+#if OTA_NTP_TIME_SYNC_ENABLED
+    // NTP supplies UTC. The calendar's local-time offset remains the value
+    // configured by the phone and stored in NVS.
+    configTime(0, 0, OTA_NTP_PRIMARY_SERVER, OTA_NTP_FALLBACK_SERVER);
+    const unsigned long startedAt = millis();
+    time_t epoch = 0;
+    while (millis() - startedAt < OTA_NTP_SYNC_TIMEOUT_MS) {
+        epoch = time(nullptr);
+        if (epoch >= 1700000000) {
+            const bool firstSync = configuration_set_time(static_cast<uint32_t>(epoch));
+            Serial.printf("NTP time synchronized: %lu%s\n", static_cast<unsigned long>(epoch),
+                          firstSync ? " (first sync)" : "");
+            return true;
+        }
+        delay(200);
+    }
+    Serial.println("NTP time synchronization failed; awaiting phone time sync.");
+    return false;
+#else
+    return false;
+#endif
+}
 
 bool initNetwork() {
     WiFi.mode(WIFI_STA);
@@ -67,6 +94,7 @@ void ota_setup() {
   Serial.flush();
 
   if (initNetwork()) {
+    ota_sync_time_ntp();
     initMDns();
     checkUpdates();
   }

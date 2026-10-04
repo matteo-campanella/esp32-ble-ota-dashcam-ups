@@ -108,6 +108,18 @@ uint32_t configuration_now_epoch() {
     return rtcClock.epochAtBoot + ((millis() - runtimeBootMillis) / 1000UL);
 }
 
+bool configuration_set_time(uint32_t epochSeconds) {
+    const bool firstClockSynchronization = !rtcClock.known;
+    rtcClock.epochAtBoot = epochSeconds;
+    runtimeBootMillis = millis();
+    rtcClock.known = true;
+    if (firstClockSynchronization) {
+        // Earlier retained records have no trustworthy timestamp.
+        history_clear();
+    }
+    return firstClockSynchronization;
+}
+
 bool configuration_calendar_allows_on() {
     if (!deviceConfiguration.calendarEnabled || !configuration_clock_is_known()) return true;
 
@@ -196,16 +208,11 @@ bool configuration_handle_command(const String& command, String& response) {
         if (values[0] < 1700000000L || values[1] < -840 || values[1] > 840) {
             response = "CFG ERR TIME";
         } else {
-            const bool firstClockSynchronization = !rtcClock.known;
-            rtcClock.epochAtBoot = static_cast<uint32_t>(values[0]);
-            runtimeBootMillis = millis();
-            rtcClock.known = true;
+            const bool firstClockSynchronization =
+                configuration_set_time(static_cast<uint32_t>(values[0]));
             deviceConfiguration.utcOffsetMinutes = static_cast<int16_t>(values[1]);
             saveConfiguration();
             if (firstClockSynchronization) {
-                // The current cycle was measured before a trustworthy time was
-                // available. Do not export it (or older zero-time records).
-                history_clear();
                 response = "CFG OK TIME FIRST";
             } else {
                 response = "CFG OK TIME";

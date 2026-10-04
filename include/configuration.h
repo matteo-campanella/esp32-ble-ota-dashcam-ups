@@ -40,6 +40,9 @@ void configuration_prepare_sleep(uint32_t seconds);
 
 bool configuration_clock_is_known();
 uint32_t configuration_now_epoch();
+// Sets the retained UTC clock and clears pre-time-sync history on its first
+// successful synchronization. Returns true when this was that first sync.
+bool configuration_set_time(uint32_t epochSeconds);
 bool configuration_calendar_allows_on();
 bool configuration_load_is_allowed();
 uint32_t configuration_seconds_until_transition();
